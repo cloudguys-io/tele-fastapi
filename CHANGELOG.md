@@ -6,7 +6,7 @@ First release.
 
 - `TeleSigner`: user tokens (≤ 1 h) and service tokens (≤ 10 min) with the same claims, limits and validation as
   `teletoken` (Go) and `@tele/node`.
-- `TeleClient` and `AsyncTeleClient` for every `/v1` endpoint: calls, members, sessions, invites and previews,
+- `TeleClient` and `AsyncTeleClient` for every endpoint in the Tele guide: calls, members, sessions, invites and previews,
   joins (user token, or service token on a user's behalf, with `X-Client-Platform`), chat, recordings (including
   streaming downloads with `Range` and restore), diagnostics, webhooks (CRUD, rotate, test, deliveries, retry,
   `Tele-Client` for admin keys), tenant API keys, usage (JSON and CSV), rates and `me`. Service tokens are minted

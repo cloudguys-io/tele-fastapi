@@ -4,7 +4,7 @@ The Python server SDK for [Tele](https://tele-api.cloudguys.io), the hosted vide
 FastAPI integration.
 
 - `TeleSigner` signs user and service tokens (HS256, the same claims and limits as the Go and Node helpers).
-- `TeleClient` (sync) and `AsyncTeleClient` (async) cover every `/v1` endpoint with typed pydantic models.
+- `TeleClient` (sync) and `AsyncTeleClient` (async) cover every endpoint in the Tele guide with typed pydantic models.
   Built from a signer, they mint and cache service tokens for you; `.as_user(user)` acts as one of your users.
 - `tele_fastapi.webhooks` verifies Tele's Standard Webhooks signatures and parses every event into a typed model.
 - `tele_fastapi.fastapi` gives you a token endpoint, a join proxy for the call UI and mobile apps, a webhook
@@ -78,6 +78,10 @@ Claims: `iss` (your key), `sub` (user tokens), `iat`, `nbf`, `exp`, optional `na
 `tele.scope` (`"user"` or `"service"`). `id` is required and at most 128 characters; `name` and `team` at most 64.
 Invalid input raises `TokenError` (a `ValueError`).
 
+**`TeleUser` or `CallUser`?** `TeleUser(id, name, team)` is *who a token acts as*: pass it to `user_token`,
+`as_user` and the FastAPI routers. `CallUser(user_id, name, team)` is *a user inside a request body*: a call's
+`host` or `members` (and `JoinUser` adds `ip` and `user_agent` for service-token joins).
+
 ## Clients
 
 ```python
@@ -95,7 +99,10 @@ tenant = admin.for_tenant(tenant_client_id)  # admin keys: sends Tele-Client for
 `timeout=`, `headers=`, or `service_token_ttl=`. The default base URL is `https://tele-api.cloudguys.io`.
 
 Optional arguments left as `None` are not sent, so Tele applies its defaults or leaves the field unchanged.
-Datetimes must be timezone-aware. Money fields are `Decimal`.
+Datetimes must be timezone-aware. Money fields are `Decimal`. Enumerated response fields (`status`, `role`,
+`access_policy`, `scope`, recording `state`...) are plain strings, so a value added to Tele later never breaks
+parsing. Secrets and tokens (`api_secret`, webhook `secret`, join `token`, TURN credentials, invite `code`/`url`)
+are left out of `repr()` and `str()`.
 
 | Area | Methods |
 |---|---|
@@ -140,7 +147,8 @@ Every non-2xx response raises a `TeleError` with `status`, `code`, `message`, `o
 `request_id` (from an `X-Request-Id` response header, when a proxy adds one) and the parsed `body`. Subclasses by
 status: `BadRequestError` (400), `AuthenticationError` (401), `PermissionDeniedError` (403), `NotFoundError` (404),
 `ConflictError` (409), `GoneError` (410), `RateLimitedError` (429), `NotImplementedByServerError` (501) and
-`ServerError` (5xx). Helpers: `err.retryable`, `err.is_join_window`, `err.is_invite_invalid`, `err.is_call_closed`.
+`ServerError` (5xx). A 2xx body that doesn't fit the model raises `TeleResponseError` (`code == "invalid_response"`,
+raw body in `body`). Helpers: `err.retryable`, `err.is_join_window`, `err.is_invite_invalid`, `err.is_call_closed`.
 Branch on `code`:
 
 ```python
@@ -235,15 +243,25 @@ there for anonymous requests). `get_user` may be a callable or a `Depends(...)`.
 | `POST /tele/calls/{call_id}/join` | `POST /v1/calls/{call_id}/join` |
 | `POST /tele/calls/{call_id}/diagnostics` | `POST /v1/calls/{call_id}/diagnostics` (turn off with `diagnostics=False`) |
 
-Each request runs as the signed-in user with a fresh user token and carries the user's IP (`X-Forwarded-For`), user
-agent and `X-Client-Platform` (from the app's request, default `default_platform="web"`). Tele's response, success
-or error, is returned unchanged, so the UI gets the exact join response or Tele error body.
+Each request runs as the signed-in user and carries their user agent and `X-Client-Platform` (from the app's
+request, default `default_platform="web"`). Tele's answer is returned unchanged, so the UI gets the exact join
+response or Tele error body, except that a Tele `401` (your backend's own credentials) becomes
+`502 upstream_auth`, a Tele `5xx` becomes `502 upstream_error`, and network failures become
+`502 upstream_unreachable` or `503 upstream_timeout`, all in Tele's `{"error": {"code", "message"}}` shape.
+Diagnostic bodies over 64 KB are refused with `413` without being buffered.
 
-Tele only trusts `X-Forwarded-For` from proxies it is configured to trust. If your backend is not one, pass
-`service_join=True`: call joins then use your service token with the user and IP in the body, which Tele always
-records (invite joins still use the user's token). The client IP comes from `request.client.host`; behind a reverse
-proxy run uvicorn with `--proxy-headers --forwarded-allow-ips=...`, or pass `client_ip=lambda request: ...`.
-Pass `client=` to use a specific `AsyncTeleClient` instead of the lifespan one.
+**Client IPs.** Hosted Tele does not trust your backend as a proxy, so it ignores `X-Forwarded-For` from it.
+
+- **Call joins** use your service token with the user and their IP in the body (`service_join=True`, the
+  default), which Tele always records. Set `service_join=False` only if Tele trusts your backend as a proxy; it
+  then forwards the user's token with `X-Forwarded-For`.
+- **Invite joins** must use the user's token: Tele refuses service tokens there. **Tele then records your
+  backend's IP, not the user's**, unless the app joins Tele directly (with a user token from the token endpoint)
+  or your backend is a proxy Tele trusts.
+
+The client IP comes from `request.client.host`; behind a reverse proxy run uvicorn with
+`--proxy-headers --forwarded-allow-ips=...`, or pass `client_ip=lambda request: ...`. Pass `client=` to use a
+specific `AsyncTeleClient` instead of the lifespan one.
 
 ### Webhook dependency
 
@@ -253,13 +271,15 @@ from tele_fastapi.fastapi import TeleWebhook
 from tele_fastapi.webhooks import TeleEvent
 
 
-@app.post("/tele/webhooks", status_code=204)
+@app.post("/tele/webhooks", status_code=204, response_model=None)
 async def tele_webhook(event: TeleEvent = Depends(TeleWebhook(os.environ["TELE_WEBHOOK_SECRET"]))): ...
 ```
 
 `TeleWebhook` reads the raw body, verifies it, and yields the typed event. A bad or stale signature answers
 `401`, a body that isn't a Tele event `400`. The secret may be a string, a list (while you switch secrets), or a
 callable returning either (for secrets you load or rotate at runtime; it answers `503` while that returns nothing).
+Malformed secrets in a list are skipped; if none is usable it answers `500` (a configuration error), and
+`verify_webhook` raises `WebhookSecretError`.
 Answer within 10 seconds and do slow work afterwards; deliveries are at least once and unordered.
 
 ## Security notes
@@ -279,6 +299,7 @@ uv sync
 uv run pytest                      # unit tests; integration tests skip without a live API
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run python scripts/gen_async.py # after editing endpoint methods in client.py
+uv run --isolated --resolution lowest-direct --python 3.10 --group dev pytest tests/unit   # the declared floors
 ```
 
 The endpoint methods of `AsyncTeleClient` are generated from `TeleClient` by `scripts/gen_async.py`; CI and the
