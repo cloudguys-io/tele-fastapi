@@ -217,6 +217,9 @@ def test_stream_recording_sync_with_range() -> None:
     assert seen[0].url.path == "/v1/recordings/rec-1/download"
     assert seen[0].headers["range"] == "bytes=10-19" and seen[0].headers["authorization"] == "Bearer t"
     assert tele.download_recording("rec-1") == VIDEO
+    video = tele.open_recording("rec-1")
+    assert video.status_code == 200 and not video.partial and video.read() == VIDEO
+    video.close()
     with pytest.raises(ConflictError, match="archived"):
         tele.download_recording("missing")
 
@@ -232,6 +235,11 @@ def test_stream_recording_async() -> None:
                 chunks = [c async for c in video.aiter_bytes(2)]
             assert b"".join(chunks) == VIDEO[:4]
             assert await tele.download_recording("rec-1") == VIDEO
+            opened = await tele.open_recording("rec-1", range="bytes=4-7")
+            assert opened.content_range == "bytes 4-7/2560" and await opened.read() == VIDEO[4:8]
+            await opened.aclose()
+            with pytest.raises(ConflictError):
+                await tele.open_recording("missing")
             with pytest.raises(ConflictError):
                 await tele.download_recording("missing")
             assert (await tele.raw_request("GET", "/v1/recordings/missing/download")).status_code == 409

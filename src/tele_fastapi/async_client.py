@@ -45,7 +45,10 @@ __all__ = ["AsyncRecordingStream", "AsyncTeleClient"]
 
 
 class AsyncRecordingStream(b.RecordingStreamBase):
-    """A recording download in progress. Read it with :meth:`aiter_bytes`; closed when the ``async with`` ends."""
+    """A recording download in progress. Read it with :meth:`aiter_bytes`, then :meth:`aclose` it."""
+
+    async def aclose(self) -> None:
+        await self.response.aclose()
 
     async def aiter_bytes(self, chunk_size: int = 64 * 1024) -> AsyncIterator[bytes]:
         async for chunk in self.response.aiter_bytes(chunk_size):
@@ -166,30 +169,45 @@ class AsyncTeleClient:
     ) -> httpx.Response:
         return b.check(await self.raw_request(method, path, params=params, json=json, headers=headers, auth=auth))
 
-    @asynccontextmanager
-    async def stream_recording(
-        self, recording_id: str, *, range: str | None = None
-    ) -> AsyncIterator[AsyncRecordingStream]:
-        """Stream a recording's MP4. Pass ``range`` (for example ``"bytes=0-1023"``) to fetch part of it.
+    async def open_recording(self, recording_id: str, *, range: str | None = None) -> AsyncRecordingStream:
+        """Start streaming a recording's MP4; you must :meth:`AsyncRecordingStream.aclose` it.
 
-        >>> async with tele.stream_recording(rec_id, range=request.headers.get("range")) as video:
-        ...     async for chunk in video.aiter_bytes(): ...
+        Pass ``range`` (for example ``"bytes=0-1023"`` or the browser's ``Range`` header) to fetch part of it;
+        the answer is then ``206`` with ``content_range``. Raises :class:`TeleError` (``409 archived``,
+        ``410 expired``...) before any bytes are read. Handy for proxying to a ``<video>`` tag::
+
+            video = await tele.open_recording(rec_id, range=request.headers.get("range"))
+            return StreamingResponse(video.aiter_bytes(), status_code=video.status_code,
+                                     headers=video.passthrough_headers(), background=BackgroundTask(video.aclose))
         """
         h = b.build_headers(self._credentials, self._headers)
         h["Accept"] = "video/mp4"
         if range:
             h["Range"] = range
-        request = self._http.build_request(
-            "GET", f"{self.base_url}/v1/recordings/{b.seg(recording_id)}/download", headers=h
-        )
-        response = await self._http.send(request, stream=True)
-        try:
-            if not response.is_success:
+        url = f"{self.base_url}/v1/recordings/{b.seg(recording_id)}/download"
+        response = await self._http.send(self._http.build_request("GET", url, headers=h), stream=True)
+        if not response.is_success:
+            try:
                 await response.aread()
-                b.check(response)
-            yield AsyncRecordingStream(response)
+            finally:
+                await response.aclose()
+            b.check(response)
+        return AsyncRecordingStream(response)
+
+    @asynccontextmanager
+    async def stream_recording(
+        self, recording_id: str, *, range: str | None = None
+    ) -> AsyncIterator[AsyncRecordingStream]:
+        """:meth:`open_recording` as an async context manager.
+
+        >>> async with tele.stream_recording(rec_id) as video:
+        ...     async for chunk in video.aiter_bytes(): ...
+        """
+        video = await self.open_recording(recording_id, range=range)
+        try:
+            yield video
         finally:
-            await response.aclose()
+            await video.aclose()
 
     async def download_recording(self, recording_id: str, *, range: str | None = None) -> bytes:
         """Download a recording (or a ``range`` of it) into memory."""

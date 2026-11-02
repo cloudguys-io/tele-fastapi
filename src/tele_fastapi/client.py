@@ -45,7 +45,10 @@ __all__ = ["RecordingStream", "TeleClient"]
 
 
 class RecordingStream(b.RecordingStreamBase):
-    """A recording download in progress. Read it with :meth:`iter_bytes`; it is closed when the ``with`` ends."""
+    """A recording download in progress. Read it with :meth:`iter_bytes`, then :meth:`close` it."""
+
+    def close(self) -> None:
+        self.response.close()
 
     def iter_bytes(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
         yield from self.response.iter_bytes(chunk_size)
@@ -163,28 +166,39 @@ class TeleClient:
     ) -> httpx.Response:
         return b.check(self.raw_request(method, path, params=params, json=json, headers=headers, auth=auth))
 
-    @contextmanager
-    def stream_recording(self, recording_id: str, *, range: str | None = None) -> Iterator[RecordingStream]:
-        """Stream a recording's MP4. Pass ``range`` (for example ``"bytes=0-1023"``) to fetch part of it.
+    def open_recording(self, recording_id: str, *, range: str | None = None) -> RecordingStream:
+        """Start streaming a recording's MP4; you must :meth:`RecordingStream.close` it.
 
-        >>> with tele.stream_recording(rec_id) as video:
-        ...     for chunk in video.iter_bytes(): out.write(chunk)
+        Pass ``range`` (for example ``"bytes=0-1023"`` or the browser's ``Range`` header) to fetch part of it;
+        the answer is then ``206`` with ``content_range``. Raises :class:`TeleError` (``409 archived``,
+        ``410 expired``...) before any bytes are read.
         """
         h = b.build_headers(self._credentials, self._headers)
         h["Accept"] = "video/mp4"
         if range:
             h["Range"] = range
-        request = self._http.build_request(
-            "GET", f"{self.base_url}/v1/recordings/{b.seg(recording_id)}/download", headers=h
-        )
-        response = self._http.send(request, stream=True)
-        try:
-            if not response.is_success:
+        url = f"{self.base_url}/v1/recordings/{b.seg(recording_id)}/download"
+        response = self._http.send(self._http.build_request("GET", url, headers=h), stream=True)
+        if not response.is_success:
+            try:
                 response.read()
-                b.check(response)
-            yield RecordingStream(response)
+            finally:
+                response.close()
+            b.check(response)
+        return RecordingStream(response)
+
+    @contextmanager
+    def stream_recording(self, recording_id: str, *, range: str | None = None) -> Iterator[RecordingStream]:
+        """:meth:`open_recording` as a context manager.
+
+        >>> with tele.stream_recording(rec_id) as video:
+        ...     for chunk in video.iter_bytes(): out.write(chunk)
+        """
+        video = self.open_recording(recording_id, range=range)
+        try:
+            yield video
         finally:
-            response.close()
+            video.close()
 
     def download_recording(self, recording_id: str, *, range: str | None = None) -> bytes:
         """Download a recording (or a ``range`` of it) into memory."""

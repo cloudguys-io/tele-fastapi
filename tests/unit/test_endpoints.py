@@ -497,6 +497,7 @@ def test_every_public_endpoint_is_covered() -> None:
     skip = {
         "raw_request",
         "stream_recording",
+        "open_recording",
         "download_recording",
         "as_user",
         "with_token",
