@@ -218,6 +218,17 @@ CASES = [
         check=lambda r: (r.ice_servers[1].credential == "c" and r.call.status == "live") or pytest.fail("join"),
     ),
     Case(
+        "join_invite (service token)",
+        lambda c: c.join_invite(
+            "q3V9x2", user={"user_id": "cust-9", "ip": "203.0.113.50", "name": "C"}, platform="web"
+        ),
+        "POST",
+        "/v1/invites/q3V9x2/join",
+        P.JOIN,
+        body={"user": {"user_id": "cust-9", "ip": "203.0.113.50", "name": "C"}},
+        headers={"x-client-platform": "web"},
+    ),
+    Case(
         "join_call (user token)",
         lambda c: c.join_call("call-1", platform="ios"),
         "POST",

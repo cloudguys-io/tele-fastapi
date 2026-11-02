@@ -278,9 +278,9 @@ class AsyncTeleClient:
         to: datetime | None = None,
         limit: int | None = None,
     ) -> list[Call]:
-        """``GET /v1/calls``, newest first. A user token sees the calls it is a member of."""
+        """``GET /v1/calls``, newest first (``limit`` 1-200). A user token sees the calls it is a member of."""
         st = status if status is None or isinstance(status, str) else ",".join(status)
-        q = b.params(status=st, limit=limit, **{"from": from_, "to": to})
+        q = b.params(status=st, limit=b.limit(limit, 200), **{"from": from_, "to": to})
         return b.models(Call, await self._send("GET", "/v1/calls", params=q), "calls")
 
     async def get_call(self, call_id: str) -> Call:
@@ -365,17 +365,22 @@ class AsyncTeleClient:
         self,
         code: str,
         *,
+        user: JoinUser | Mapping[str, Any] | None = None,
         platform: str | None = None,
         forwarded_for: str | None = None,
         user_agent: str | None = None,
     ) -> JoinResponse:
-        """``POST /v1/invites/{code}/join`` with a user token.
+        """``POST /v1/invites/{code}/join``.
 
-        ``platform`` is sent as ``X-Client-Platform``. When your backend is a trusted proxy for Tele,
-        ``forwarded_for`` (the end user's IP, sent as ``X-Forwarded-For``) and ``user_agent`` record the real client.
+        With a user token, joins as that user. With a service token, pass ``user`` (``user_id`` and the end user's
+        ``ip`` are required) to join on their behalf; Tele records that IP. ``platform`` is sent as
+        ``X-Client-Platform``. ``forwarded_for`` and ``user_agent`` are sent as headers; hosted Tele ignores
+        ``X-Forwarded-For`` from customer backends, so prefer ``user=`` with a service token.
         """
         h = b.join_headers(platform, forwarded_for, user_agent)
-        return b.model(JoinResponse, await self._send("POST", f"/v1/invites/{b.seg(code)}/join", headers=h))
+        data = {"user": b.join_user_input(user)} if user is not None else None
+        r = await self._send("POST", f"/v1/invites/{b.seg(code)}/join", json=data, headers=h)
+        return b.model(JoinResponse, r)
 
     async def join_call(
         self,
@@ -401,7 +406,7 @@ class AsyncTeleClient:
         self, call_id: str, *, after: str | None = None, limit: int | None = None
     ) -> list[ChatMessage]:
         """``GET /v1/calls/{id}/messages``. Page with ``after=<last message id>``; ``limit`` ≤ 500."""
-        q = b.params(after=after, limit=limit)
+        q = b.params(after=after, limit=b.limit(limit, 500))
         return b.models(
             ChatMessage, await self._send("GET", f"/v1/calls/{b.seg(call_id)}/messages", params=q), "messages"
         )
@@ -490,8 +495,11 @@ class AsyncTeleClient:
     async def list_webhook_deliveries(
         self, webhook_id: str, *, status: str | None = None, limit: int | None = None
     ) -> list[WebhookDelivery]:
-        """``GET /v1/webhooks/{id}/deliveries``. ``status``: ``pending``, ``delivered`` or ``failed``."""
-        q = b.params(status=status, limit=limit)
+        """``GET /v1/webhooks/{id}/deliveries``. ``status``: ``pending``, ``delivered`` or ``failed``.
+
+        ``limit`` is 1-200.
+        """
+        q = b.params(status=status, limit=b.limit(limit, 200))
         r = await self._send("GET", f"/v1/webhooks/{b.seg(webhook_id)}/deliveries", params=q)
         return b.models(WebhookDelivery, r, "deliveries")
 

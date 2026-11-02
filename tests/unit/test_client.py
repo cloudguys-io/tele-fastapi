@@ -7,6 +7,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import jwt
@@ -359,3 +360,31 @@ def test_unknown_enum_values_parse_and_bad_bodies_raise_tele_response_error() ->
             op()
         assert info.value.code == "invalid_response" and info.value.status == 200
         assert isinstance(info.value, TeleError)
+
+
+@pytest.mark.parametrize(
+    ("call", "maximum"),
+    [
+        (lambda t, n: t.list_calls(limit=n), 200),
+        (lambda t, n: t.list_messages("c", limit=n), 500),
+        (lambda t, n: t.list_webhook_deliveries("w", limit=n), 200),
+    ],
+)
+def test_list_limits_match_the_server(call: Any, maximum: int) -> None:
+    seen, transport = recorder(json={"calls": [], "messages": [], "deliveries": []})
+    tele = TeleClient(token="t", http_client=httpx.Client(transport=transport))
+    for bad in (0, -1, maximum + 1, True):
+        with pytest.raises(ValueError, match=f"limit must be 1 to {maximum}"):
+            call(tele, bad)
+    assert seen == []
+    call(tele, 1)
+    call(tele, maximum)
+    assert [r.url.params["limit"] for r in seen] == ["1", str(maximum)]
+
+    async def run() -> None:
+        http = httpx.AsyncClient(transport=transport)
+        async with AsyncTeleClient(token="t", http_client=http) as atele:
+            with pytest.raises(ValueError):
+                await call(atele, maximum + 1)
+
+    asyncio.run(run())

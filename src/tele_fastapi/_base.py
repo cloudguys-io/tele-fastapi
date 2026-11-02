@@ -103,6 +103,13 @@ def seg(value: str) -> str:
     return quote(value, safe="")
 
 
+def limit(value: int | None, maximum: int) -> int | None:
+    """Check a list ``limit`` against Tele's range (1..maximum); ``None`` means Tele's default."""
+    if isinstance(value, bool) or (value is not None and not 1 <= value <= maximum):
+        raise ValueError(f"tele: limit must be 1 to {maximum}")
+    return value
+
+
 def ts(value: datetime) -> str:
     """RFC 3339 for a timezone-aware datetime."""
     if value.tzinfo is None or value.utcoffset() is None:
