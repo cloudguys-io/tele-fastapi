@@ -1,6 +1,6 @@
 [project]
 name = "tele-fastapi"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python server SDK for the Tele video-calling API, with first-class FastAPI integration"
 readme = "README.md"
 license = "MIT"
@@ -41,6 +41,9 @@ dev = [
 [build-system]
 requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/tele_fastapi/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tele_fastapi"]

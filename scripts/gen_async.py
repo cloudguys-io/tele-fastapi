@@ -32,7 +32,7 @@ def generate() -> str:
     head, _, tail = block((PKG / "async_client.py").read_text())
     text = head + START + to_async(sync_mid) + END + tail
     return subprocess.run(
-        ["ruff", "format", "--stdin-filename", "async_client.py", "-"],
+        [sys.executable, "-m", "ruff", "format", "--stdin-filename", "async_client.py", "-"],
         input=text,
         capture_output=True,
         text=True,
