@@ -14,12 +14,12 @@ The core needs only `httpx`, `pydantic` (v2) and `PyJWT`. FastAPI is an optional
 
 ## Install
 
-From the `v0.1.0` tag:
+From the `v0.2.0` tag:
 
 ```bash
-pip install "tele-fastapi[fastapi] @ git+https://github.com/cloudguys-io/tele-fastapi@v0.1.0"
+pip install "tele-fastapi[fastapi] @ git+https://github.com/cloudguys-io/tele-fastapi@v0.2.0"
 # or
-uv add "tele-fastapi[fastapi] @ git+https://github.com/cloudguys-io/tele-fastapi@v0.1.0"
+uv add "tele-fastapi[fastapi] @ git+https://github.com/cloudguys-io/tele-fastapi@v0.2.0"
 ```
 
 Leave out `[fastapi]` if you only need the client, tokens and webhooks.
@@ -109,7 +109,7 @@ are left out of `repr()` and `str()`.
 | Calls | `create_call`, `list_calls`, `get_call`, `update_call`, `cancel_call`, `end_call` |
 | Members, sessions | `put_member`, `remove_member`, `list_sessions` |
 | Invites | `create_invite`, `list_invites`, `revoke_invite`, `preview_invite` |
-| Joining | `join_invite(code, platform=, forwarded_for=, user_agent=)`, `join_call(call_id, user=JoinUser(...), platform=...)` |
+| Joining | `join_invite(code, user=JoinUser(...), platform=)`, `join_call(call_id, user=JoinUser(...), platform=)` |
 | Chat | `list_messages(call_id, after=, limit=)`, `post_message(call_id, stream_id, body, sent_at=)` |
 | Recordings | `start_recording`, `stop_recording`, `list_recordings`, `get_recording`, `restore_recording`, `open_recording`, `stream_recording`, `download_recording` |
 | Diagnostics | `report_diagnostic(call_id, body)` (forward the `<tele-call>` diagnostic body) |
@@ -135,8 +135,10 @@ code = call.invite.code  # one-time: store or send it now
 # as the user (their app called your backend)
 join = tele.as_user(TeleUser(id="cust-9001")).join_invite(code, platform="android")
 
-# or on the user's behalf with the service token: Tele needs the end user's IP
-join = tele.join_call(call.id, user=JoinUser(user_id="cust-9001", ip="203.0.113.50", user_agent="YourApp/3.2"))
+# or on the user's behalf with the service token (invite or call id): Tele records the end user's IP
+cust = JoinUser(user_id="cust-9001", ip="203.0.113.50", user_agent="YourApp/3.2")
+join = tele.join_invite(code, user=cust)
+join = tele.join_call(call.id, user=cust)  # rejoins use the call id
 
 join.ws_url, join.token, join.ice_servers  # hand these to the media SDK as is (ice_servers may be None)
 ```
@@ -235,7 +237,7 @@ The routers serve the route convention every Tele SDK shares (prefix `/api/tele`
 |---|---|---|---|
 | POST | `/api/tele/token` | user token for the signed-in user | `{"token": "...", "expires_at": "RFC3339"}` |
 | GET | `/api/tele/invites/{code}` | invite preview, as the user (user token) | Tele's body unchanged |
-| POST | `/api/tele/invites/{code}/join` | invite join, as the user (user token) | Tele's join response unchanged |
+| POST | `/api/tele/invites/{code}/join` | invite join, service token with `user: {user_id, ip, user_agent, name?, team?}` | Tele's join response unchanged |
 | POST | `/api/tele/calls/{id}/join` | call join, service token with `user: {user_id, ip, user_agent, name?, team?}` | Tele's join response unchanged |
 | GET | `/api/tele/calls/{id}/messages` | chat history as the user (`after`, `limit` passed through) | Tele's body unchanged |
 | POST | `/api/tele/calls/{id}/diagnostics` | forwards the call UI's diagnostic body as the user | Tele's status and body |
@@ -265,16 +267,12 @@ The routers get this from `TeleErrorRoute`, a route class you can reuse for your
 (`APIRouter(route_class=TeleErrorRoute)`), and `tele_error_response(err)` turns a `TeleError` from the client into
 the same response.
 
-**Client IPs.** Tele records the request's peer IP for user-token calls and trusts no customer proxy on hosted
-Tele. So:
-
-- **Call-id joins** are service-token joins carrying the end user's IP, so Tele records the correct IP
-  (`service_join=True`, the default; `service_join=False` forwards the user's token instead and is only for a Tele
-  that trusts your backend as a proxy).
-- **Invite joins through a backend record the backend's IP.** Browsers can't avoid this (Tele sends no CORS
-  headers). Native apps can, by calling `POST /v1/invites/{code}/join` directly with a user token from
-  `/api/tele/token`.
-- After the first invite join, rejoin through the call-id route (`POST /api/tele/calls/{id}/join`).
+**Client IPs.** Both join routes are service-token joins carrying the end user's IP and user agent
+(`service_join=True`, the default), so Tele always records the user's IP. Apps that call Tele directly with a user
+token (native apps, or browsers: the Tele API allows any origin via CORS, with auth only in the `Authorization`
+header) also record the user's IP. Hosted Tele still trusts no customer proxy's `X-Forwarded-For`, so
+`service_join=False` (forward the user's token with `X-Forwarded-For`) is only for a Tele that trusts your backend
+as a proxy. Rejoins after the first invite join use the call-id route (`POST /api/tele/calls/{id}/join`).
 
 The end user's IP comes from `request.client.host`; behind a reverse proxy run uvicorn with
 `--proxy-headers --forwarded-allow-ips=...`, or pass `client_ip=lambda request: ...`. Pass `client=` to use a
@@ -291,10 +289,11 @@ app.include_router(tele_join_router(current_user))  # the other /api/tele routes
 
 - **tele-nextjs-ui** calls `/api/tele/invites/{code}` for the lobby, `/api/tele/invites/{code}/join` and
   `/api/tele/calls/{id}/join` for `getJoin()`, `/api/tele/calls/{id}/messages` for chat history and
-  `/api/tele/calls/{id}/diagnostics` for diagnostics, on the same origin.
+  `/api/tele/calls/{id}/diagnostics` for diagnostics, on the same origin. Browsers may also call Tele directly
+  with a user token from `/api/tele/token`.
 - **tele-flutter** points at your backend's base URL and calls the same routes with `X-Client-Platform:
-  flutter-<os>`; it can also take a user token from `/api/tele/token` to join an invite directly
-  (`POST /v1/invites/{code}/join`), so Tele records the device's own IP.
+  flutter-<os>`. It can also take a user token from `/api/tele/token` and call Tele directly; Tele records the
+  user's IP either way.
 
 If you change `prefix` or `path` here, set the same base path in the UI or app.
 
