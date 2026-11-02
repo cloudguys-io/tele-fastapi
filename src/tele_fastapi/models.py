@@ -1,23 +1,22 @@
 """Typed request and response models shared by :class:`TeleClient` and :class:`AsyncTeleClient`.
 
 Response models keep unknown fields (``extra="allow"``) so a newer Tele server never breaks an older SDK.
+Enumerations are plain ``str`` (the documented values are listed on each field) for the same reason.
 Money is a :class:`~decimal.Decimal` (Tele sends decimal strings with 4 places). Times are timezone-aware.
+Secrets and tokens are left out of ``repr()`` and ``str()`` so they don't end up in logs.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "APIClient",
-    "AccessPolicy",
     "Call",
     "CallMember",
-    "CallStatus",
     "CallUser",
     "ChatMessage",
     "Denial",
@@ -45,9 +44,6 @@ __all__ = [
     "WebhookEndpoint",
     "WebhookTestResult",
 ]
-
-CallStatus = Literal["scheduled", "live", "ended", "cancelled"]
-AccessPolicy = Literal["listed_only", "any_client_user"]
 
 
 class TeleModel(BaseModel):
@@ -98,22 +94,24 @@ class Me(TeleModel):
     """``GET /v1/me``: who the token represents."""
 
     client: str
-    scope: Literal["user", "service"]
+    scope: str
+    """``user`` or ``service``."""
     user: User | None = None
 
 
 class CallMember(TeleModel):
     user_id: str
     name: str
-    role: Literal["host", "participant"]
+    role: str
+    """``host`` or ``participant``."""
     added_at: datetime
 
 
 class Invite(TeleModel):
     id: str
-    code: str | None = None
+    code: str | None = Field(default=None, repr=False)
     """Only returned when the invite is created."""
-    url: str | None = None
+    url: str | None = Field(default=None, repr=False)
     """Only at creation, and only if your key has an invite URL template."""
     label: str = ""
     expires_at: datetime | None = None
@@ -126,8 +124,10 @@ class Invite(TeleModel):
 class Call(TeleModel):
     id: str
     title: str
-    status: CallStatus
-    access_policy: AccessPolicy
+    status: str
+    """``scheduled``, ``live``, ``ended`` or ``cancelled``."""
+    access_policy: str
+    """``listed_only`` or ``any_client_user``."""
     host_user_id: str
     scheduled_start: datetime | None = None
     scheduled_end: datetime | None = None
@@ -158,7 +158,8 @@ class Denial(TeleModel):
 class PreviewCall(TeleModel):
     id: str
     title: str
-    status: CallStatus
+    status: str
+    """``scheduled``, ``live``, ``ended`` or ``cancelled``."""
     host: User
     scheduled_start: datetime | None = None
     scheduled_end: datetime | None = None
@@ -182,21 +183,22 @@ class InvitePreview(TeleModel):
 
 class ICEServer(TeleModel):
     urls: list[str]
-    username: str | None = None
-    credential: str | None = None
+    username: str | None = Field(default=None, repr=False)
+    credential: str | None = Field(default=None, repr=False)
 
 
 class JoinResponse(TeleModel):
     """Everything the media SDK needs to connect."""
 
     ws_url: str
-    token: str
+    token: str = Field(repr=False)
     token_expires_at: datetime
     ice_servers: list[ICEServer] | None = None
     """``None`` means: don't pass any ICE servers, use the SDK defaults."""
     identity: str
     grant_id: str
-    role: Literal["host", "participant"]
+    role: str
+    """``host`` or ``participant``."""
     call: Call
 
 
@@ -285,12 +287,12 @@ class WebhookEndpoint(TeleModel):
     failing_since: datetime | None = None
     created_at: datetime
     updated_at: datetime
-    secret: str | None = None
+    secret: str | None = Field(default=None, repr=False)
     """Only returned at creation: store it now."""
 
 
 class RotatedWebhookSecret(TeleModel):
-    secret: str
+    secret: str = Field(repr=False)
     previous_secret_valid_until: datetime
 
 
@@ -328,7 +330,7 @@ class APIClient(TeleModel):
     invite_url_template: str | None = None
     created_at: datetime
     revoked_at: datetime | None = None
-    api_secret: str | None = None
+    api_secret: str | None = Field(default=None, repr=False)
     """Only at creation and rotation."""
 
 

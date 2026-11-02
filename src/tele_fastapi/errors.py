@@ -24,6 +24,7 @@ __all__ = [
     "RateLimitedError",
     "ServerError",
     "TeleError",
+    "TeleResponseError",
 ]
 
 
@@ -67,6 +68,13 @@ class TeleError(Exception):
     def is_call_closed(self) -> bool:
         """The call has ended or was cancelled."""
         return self.code in ("call_ended", "call_cancelled", "call_closed")
+
+
+class TeleResponseError(TeleError):
+    """A 2xx response whose body doesn't match the expected model (``code == "invalid_response"``).
+
+    ``body`` holds the raw JSON (or text) so nothing is lost; ``__cause__`` is the validation error.
+    """
 
 
 class BadRequestError(TeleError):

@@ -9,10 +9,10 @@ from typing import Any, Protocol, TypeVar
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ._version import __version__
-from .errors import TeleError, error_from_response
+from .errors import TeleError, TeleResponseError, error_from_response
 from .models import CallUser, InviteOptions, JoinUser
 from .tokens import TeleSigner, TeleUser
 
@@ -72,6 +72,10 @@ class _CachedToken:
 class ServiceTokens(_CachedToken):
     kind = "service"
 
+    def __init__(self, signer: TeleSigner, ttl: float, refresh_before: float) -> None:
+        super().__init__(signer, ttl, refresh_before)
+        signer.service_token(ttl)  # validate the ttl up front (raises TokenError)
+
     def _mint(self) -> str:
         return self._signer.service_token(self._ttl)
 
@@ -94,8 +98,8 @@ def ttl_seconds(ttl: float | timedelta) -> float:
 
 def seg(value: str) -> str:
     """Escape one path segment."""
-    if not value:
-        raise ValueError("tele: path parameters must not be empty")
+    if not value or value in (".", ".."):
+        raise ValueError(f"tele: invalid path parameter {value!r}")
     return quote(value, safe="")
 
 
@@ -169,12 +173,34 @@ def check(response: httpx.Response) -> httpx.Response:
     raise error_from_response(response)
 
 
+def _invalid(response: httpx.Response, what: str, cause: Exception) -> TeleResponseError:
+    try:
+        raw: Any = response.json()
+    except ValueError:
+        raw = response.text[:2000]
+    return TeleResponseError(
+        response.status_code,
+        "invalid_response",
+        f"unexpected {what} response: {cause}",
+        request_id=response.headers.get("x-request-id"),
+        body=raw,
+    )
+
+
 def model(cls: type[M], response: httpx.Response) -> M:
-    return cls.model_validate(response.json())
+    """Parse a response body, raising :class:`TeleResponseError` when it doesn't fit ``cls``."""
+    try:
+        return cls.model_validate(response.json())
+    except (ValidationError, ValueError) as e:
+        raise _invalid(response, cls.__name__, e) from e
 
 
 def models(cls: type[M], response: httpx.Response, key: str) -> list[M]:
-    return [cls.model_validate(item) for item in response.json()[key]]
+    try:
+        items = response.json()[key]
+        return [cls.model_validate(item) for item in items]
+    except (ValidationError, ValueError, KeyError, TypeError) as e:
+        raise _invalid(response, f"{cls.__name__} list", e) from e
 
 
 def build_headers(credentials: Credentials | None, extra: Mapping[str, str]) -> dict[str, str]:

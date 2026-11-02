@@ -19,6 +19,7 @@ from .errors import (
     RateLimitedError,
     ServerError,
     TeleError,
+    TeleResponseError,
 )
 from .models import (
     APIClient,
@@ -52,6 +53,7 @@ from .tokens import MAX_SERVICE_TTL_SECONDS, MAX_USER_TTL_SECONDS, TeleSigner, T
 from .webhooks import (
     TeleEvent,
     WebhookPayloadError,
+    WebhookSecretError,
     WebhookVerificationError,
     construct_event,
     parse_event,
@@ -96,6 +98,7 @@ __all__ = [
     "TeleClient",
     "TeleError",
     "TeleEvent",
+    "TeleResponseError",
     "TeleSigner",
     "TeleUser",
     "TokenError",
@@ -106,6 +109,7 @@ __all__ = [
     "WebhookDeliveryRetry",
     "WebhookEndpoint",
     "WebhookPayloadError",
+    "WebhookSecretError",
     "WebhookTestResult",
     "WebhookVerificationError",
     "__version__",

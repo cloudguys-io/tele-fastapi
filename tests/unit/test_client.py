@@ -118,8 +118,12 @@ def test_naive_datetimes_and_empty_path_params_are_rejected() -> None:
         tele.create_invite("c", expires_at=datetime(2026, 1, 1))
     with pytest.raises(ValueError, match="timezone-aware"):
         tele.create_call("x", invite={"expires_at": datetime(2026, 1, 1)})
-    with pytest.raises(ValueError, match="empty"):
-        tele.get_call("")
+    for bad in ("", ".", ".."):
+        with pytest.raises(ValueError, match="invalid path parameter"):
+            tele.get_call(bad)
+    with pytest.raises(ValueError, match="invalid path parameter"):
+        tele.preview_invite("..")
+    assert tele.raw_request("GET", "/v1/calls/a.b").status_code == 200  # dots inside a segment are fine
 
 
 @pytest.mark.parametrize(
@@ -300,5 +304,58 @@ def test_service_token_ttl_and_extra_headers() -> None:
     c = claims(seen[0])
     assert c["exp"] == c["iat"] + 600  # type: ignore[operator]
     assert seen[0].headers["x-trace"] == "t-1"
-    with pytest.raises(TokenError):
-        TeleClient(TeleSigner("TK1", SECRET), service_token_ttl=601).me()
+    for bad in (601, 0, timedelta(minutes=11)):
+        with pytest.raises(TokenError):
+            TeleClient(TeleSigner("TK1", SECRET), service_token_ttl=bad)
+        with pytest.raises(TokenError):
+            AsyncTeleClient(TeleSigner("TK1", SECRET), service_token_ttl=bad)
+
+
+def test_secrets_stay_out_of_repr_and_str() -> None:
+    from tele_fastapi import APIClient, Invite, JoinResponse, RotatedWebhookSecret, WebhookEndpoint
+
+    from .payloads import CLIENT, INVITE, JOIN, WEBHOOK
+
+    values = [
+        APIClient.model_validate({**CLIENT, "api_secret": "SECRET-api"}),
+        WebhookEndpoint.model_validate({**WEBHOOK, "secret": "whsec_SECRET"}),
+        RotatedWebhookSecret.model_validate(
+            {"secret": "whsec_SECRET2", "previous_secret_valid_until": INVITE["created_at"]}
+        ),
+        JoinResponse.model_validate(JOIN),
+        Invite.model_validate(INVITE),
+    ]
+    text = " ".join(repr(v) + str(v) for v in values)
+    for secret in ("SECRET-api", "whsec_SECRET", "whsec_SECRET2", "lk-token", "credential='c'", "q3V9x2"):
+        assert secret not in text
+    assert values[0].api_secret == "SECRET-api" and values[3].token == "lk-token"  # still readable
+    assert values[3].ice_servers is not None and values[3].ice_servers[1].credential == "c"
+
+
+def test_unknown_enum_values_parse_and_bad_bodies_raise_tele_response_error() -> None:
+    from tele_fastapi import Call, TeleResponseError
+
+    from .payloads import CALL, JOIN, MEMBER
+
+    weird = {**CALL, "status": "paused", "access_policy": "org_only", "members": [{**MEMBER, "role": "cohost"}]}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/calls/new":
+            return httpx.Response(200, json=weird)
+        if request.url.path == "/v1/me":
+            return httpx.Response(200, json={"client": "c", "scope": "robot"})
+        if request.url.path == "/v1/calls":
+            return httpx.Response(200, json={"oops": []})
+        if request.url.path == "/v1/invites/x/join":
+            return httpx.Response(200, json={**JOIN, "token_expires_at": "tomorrow"})
+        return httpx.Response(200, content=b"<html>")
+
+    tele = TeleClient(token="t", http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    call = tele.get_call("new")
+    assert isinstance(call, Call) and call.status == "paused" and call.members[0].role == "cohost"
+    assert tele.me().scope == "robot"
+    for op in (tele.list_calls, lambda: tele.join_invite("x"), lambda: tele.get_recording("r")):
+        with pytest.raises(TeleResponseError) as info:
+            op()
+        assert info.value.code == "invalid_response" and info.value.status == 200
+        assert isinstance(info.value, TeleError)
