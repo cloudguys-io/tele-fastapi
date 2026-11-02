@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -28,6 +28,7 @@ from tele_fastapi import (
     TeleError,
     TeleSigner,
     TeleUser,
+    TokenError,
 )
 
 SECRET = "x" * 40
@@ -285,3 +286,19 @@ def test_core_imports_without_fastapi() -> None:
     blocked = "import sys; sys.modules['fastapi'] = None\nimport tele_fastapi.fastapi\n"
     result = subprocess.run([sys.executable, "-c", blocked], capture_output=True, text=True)
     assert "pip install" in result.stderr
+
+
+def test_service_token_ttl_and_extra_headers() -> None:
+    seen, transport = recorder()
+    tele = TeleClient(
+        TeleSigner("TK1", SECRET),
+        http_client=httpx.Client(transport=transport),
+        service_token_ttl=timedelta(minutes=10),
+        headers={"X-Trace": "t-1"},
+    )
+    tele.me()
+    c = claims(seen[0])
+    assert c["exp"] == c["iat"] + 600  # type: ignore[operator]
+    assert seen[0].headers["x-trace"] == "t-1"
+    with pytest.raises(TokenError):
+        TeleClient(TeleSigner("TK1", SECRET), service_token_ttl=601).me()
