@@ -99,14 +99,38 @@ class FakeTele:
 
 
 def proxy_app(fake: FakeTele, **kw: Any) -> FastAPI:
+    kw.setdefault("client_ip", lambda r: "203.0.113.1")  # TestClient's peer ("testclient") is not an IP
     app = FastAPI(lifespan=tele_lifespan(fake.client))
     app.include_router(tele_join_router(current_user, **kw))
     return app
 
 
-def test_invite_join_forwards_user_token_ip_platform_and_returns_body_unchanged() -> None:
+def test_invite_join_is_a_service_join_with_ip_platform_and_body_unchanged() -> None:
     fake = FakeTele()
     with TestClient(proxy_app(fake, client_ip=lambda r: "203.0.113.9")) as client:
+        r = client.post(
+            "/api/tele/invites/q3V9x2/join",
+            headers={**SIGNED_IN, "X-Client-Platform": "flutter-android", "User-Agent": "Huddle/2 (Android 15)"},
+        )
+    assert r.status_code == 200 and r.json() == P.JOIN
+    up = fake.seen[0]
+    assert up.method == "POST" and up.url.path == "/v1/invites/q3V9x2/join"
+    assert claims_of(up)["tele"] == {"scope": "service"}
+    assert json.loads(up.content) == {
+        "user": {
+            "user_id": "alice",
+            "ip": "203.0.113.9",
+            "name": "Alice",
+            "team": "sales",
+            "user_agent": "Huddle/2 (Android 15)",
+        }
+    }
+    assert up.headers["x-client-platform"] == "flutter-android" and "x-forwarded-for" not in up.headers
+
+
+def test_invite_join_as_user_when_service_join_is_off() -> None:
+    fake = FakeTele()
+    with TestClient(proxy_app(fake, service_join=False, client_ip=lambda r: "203.0.113.9")) as client:
         r = client.post(
             "/api/tele/invites/q3V9x2/join",
             headers={**SIGNED_IN, "X-Client-Platform": "Android", "User-Agent": "Huddle/2 (Android 15)"},
@@ -132,7 +156,8 @@ def test_call_join_defaults_to_a_service_join() -> None:
 
 def test_service_join_refuses_a_peer_that_is_not_an_ip() -> None:
     fake = FakeTele()
-    with TestClient(proxy_app(fake)) as client:  # TestClient's peer is "testclient" (or absent on old Starlette)
+    peer = proxy_app(fake, client_ip=lambda r: r.client.host if r.client else None)
+    with TestClient(peer) as client:  # TestClient's peer is "testclient" (or absent on old Starlette)
         r = client.post("/api/tele/calls/call-1/join", headers=SIGNED_IN)
     assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_request"
     assert fake.seen == []

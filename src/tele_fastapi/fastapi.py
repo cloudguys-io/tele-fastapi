@@ -258,8 +258,8 @@ def tele_join_router(
     a Tele token themselves:
 
     - ``GET {prefix}/invites/{code}``: invite preview, as the user
-    - ``POST {prefix}/invites/{code}/join``: invite join, as the user
-    - ``POST {prefix}/calls/{call_id}/join``: call join (a service-token join carrying the user's IP by default)
+    - ``POST {prefix}/invites/{code}/join``: invite join (a service-token join carrying the user's IP)
+    - ``POST {prefix}/calls/{call_id}/join``: call join (a service-token join carrying the user's IP)
     - ``GET {prefix}/calls/{call_id}/messages``: chat history as the user (``after`` and ``limit`` passed through)
     - ``POST {prefix}/calls/{call_id}/diagnostics`` (``diagnostics=True``; the ``<tele-call>`` diagnostics body)
 
@@ -269,14 +269,10 @@ def tele_join_router(
     a Tele ``401`` (your backend's credentials) becomes ``502 upstream_auth``, a Tele ``5xx`` becomes
     ``502 upstream_error``, and network failures become ``502 upstream_unreachable`` / ``503 upstream_timeout``.
 
-    **Client IPs.** Tele records the request's peer IP for user-token calls and trusts no customer proxy on
-    hosted Tele.
-
-    - Call-id joins are service-token joins carrying the end user's IP (``service_join=True``, the default), so
-      Tele records the correct IP. Set ``service_join=False`` only for a Tele that trusts your backend as a proxy.
-    - Invite joins through a backend record the **backend's** IP. Browsers can't avoid this (Tele sends no CORS
-      headers); native apps can, by calling ``POST /v1/invites/{code}/join`` directly with a user token from
-      :func:`tele_token_router`. After the first invite join, rejoin through the call-id route.
+    **Client IPs.** Both join routes are service-token joins carrying the end user's IP and user agent
+    (``service_join=True``, the default), so Tele always records the user's IP. Hosted Tele trusts no customer
+    proxy's ``X-Forwarded-For``, so set ``service_join=False`` (forward the user's token with ``X-Forwarded-For``)
+    only for a Tele that trusts your backend as a proxy. Rejoins after the first invite join use the call-id route.
 
     Not signed in (``get_user`` raises 401) answers ``401 {"error": {"code": "unauthenticated", ...}}``.
 
@@ -294,15 +290,34 @@ def tele_join_router(
         platform = request.headers.get("x-client-platform", "").strip().lower() or default_platform
         return platform, client_ip(request), request.headers.get("user-agent")
 
+    async def join(path: str, request: Request, user: TeleUser) -> Response:
+        platform, ip, ua = headers(request)
+        if not service_join:
+            as_user = tele_for(request).as_user(user, ttl=ttl)
+            return await _forward(lambda: as_user.raw_request("POST", path, headers=b.join_headers(platform, ip, ua)))
+        if not ip or not _is_ip(ip):
+            return _error(400, "invalid_request", "the client's IP address is unknown")
+        joiner = JoinUser(
+            user_id=user.id,
+            ip=ip,
+            name=user.name or None,
+            team=user.team or None,
+            user_agent=ua[:512] if ua else None,
+        )
+        tele = tele_for(request)
+        return await _forward(
+            lambda: tele.raw_request(
+                "POST", path, json={"user": b.join_user_input(joiner)}, headers=b.join_headers(platform, None, None)
+            )
+        )
+
     @router.post("/invites/{code}/join", summary="Join a Tele call through an invite")
     async def join_invite(code: str, request: Request, user: TeleUser = user_dep) -> Response:
         try:
             path = f"/v1/invites/{b.seg(code)}/join"
         except ValueError:
             return _error(404, "invite_not_found", "invite not found")
-        platform, ip, ua = headers(request)
-        tele = tele_for(request).as_user(user, ttl=ttl)
-        return await _forward(lambda: tele.raw_request("POST", path, headers=b.join_headers(platform, ip, ua)))
+        return await join(path, request, user)
 
     @router.get("/invites/{code}", summary="Preview a Tele invite")
     async def preview_invite(code: str, request: Request, user: TeleUser = user_dep) -> Response:
@@ -329,25 +344,7 @@ def tele_join_router(
             path = f"/v1/calls/{b.seg(call_id)}/join"
         except ValueError:
             return _error(404, "not_found", "call not found")
-        platform, ip, ua = headers(request)
-        if not service_join:
-            as_user = tele_for(request).as_user(user, ttl=ttl)
-            return await _forward(lambda: as_user.raw_request("POST", path, headers=b.join_headers(platform, ip, ua)))
-        if not ip or not _is_ip(ip):
-            return _error(400, "invalid_request", "the client's IP address is unknown")
-        joiner = JoinUser(
-            user_id=user.id,
-            ip=ip,
-            name=user.name or None,
-            team=user.team or None,
-            user_agent=ua[:512] if ua else None,
-        )
-        tele = tele_for(request)
-        return await _forward(
-            lambda: tele.raw_request(
-                "POST", path, json={"user": b.join_user_input(joiner)}, headers=b.join_headers(platform, None, None)
-            )
-        )
+        return await join(path, request, user)
 
     if diagnostics:
 
