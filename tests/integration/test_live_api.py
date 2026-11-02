@@ -344,3 +344,34 @@ def test_async_client_live(signer: TeleSigner, base_url: str, uid: str) -> None:
             assert (await tele.as_user(host).end_call(call.id)).status == "ended"
 
     asyncio.run(run())
+
+
+def test_service_invite_join_and_user_ids_with_slashes(tele: TeleClient, uid: str) -> None:
+    host = person(uid, "Host")
+    slashed = f"{uid}/org-7/user"  # user ids may contain "/": escaped as %2F in member paths
+    call = tele.create_call(f"{uid} service invite", host={"user_id": host.id}, max_participants=4)
+    assert call.invite is not None and call.invite.code
+    try:
+        members = tele.put_member(call.id, slashed, name="Slashed")
+        assert slashed in {m.user_id for m in members}
+
+        # a service token joins through the invite on the user's behalf, with their IP
+        joined = tele.join_invite(
+            call.invite.code,
+            user=JoinUser(user_id=slashed, ip="198.51.100.31", user_agent="it/svc-invite", name="Slashed"),
+            platform="flutter-ios",
+        )
+        assert joined.role == "participant" and joined.call.id == call.id
+        with pytest.raises(BadRequestError):
+            tele.join_invite(call.invite.code)  # a service token must say who is joining
+
+        tele.remove_member(call.id, slashed)
+        assert slashed not in {m.user_id for m in tele.get_call(call.id).members}
+
+        # list limits outside the server's range are refused before any request
+        with pytest.raises(ValueError, match="1 to 200"):
+            tele.list_calls(limit=201)
+        assert len(tele.list_calls(limit=1)) <= 1
+        assert tele.raw_request("GET", "/v1/calls", params={"limit": "201"}).status_code == 400
+    finally:
+        tele.cancel_call(call.id)
