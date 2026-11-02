@@ -14,5 +14,7 @@ First release.
 - Typed pydantic v2 models and `TeleError` subclasses with `code`, `message`, `opens_at` and `request_id`.
 - `tele_fastapi.webhooks`: Standard Webhooks verification (5 minute tolerance, several signatures during a secret
   rotation) and typed models for every event type, with an `UnknownEvent` fallback.
-- `tele_fastapi.fastapi`: `tele_token_router`, `tele_join_router` (invite and call joins, diagnostics),
-  `TeleWebhook`, `tele_lifespan`, `get_tele` and `TeleClientDep`.
+- `tele_fastapi.fastapi`: the shared backend routes under `/api/tele` (`tele_token_router` for `POST /token`;
+  `tele_join_router` for the invite preview and join, call join, chat history and diagnostics), errors in Tele's
+  shape (`TeleErrorRoute`, `tele_error_response`), `TeleWebhook`, `tele_lifespan`, `get_tele` and
+  `TeleClientDep`.

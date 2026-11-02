@@ -44,8 +44,8 @@ def current_user(request: Request) -> TeleUser:
     return TeleUser(id=session["id"], name=session["name"], team=session["org"])
 
 
-app.include_router(tele_token_router(signer, current_user))  # POST /tele/token
-app.include_router(tele_join_router(current_user))  # POST /tele/invites/{code}/join, /tele/calls/{id}/join
+app.include_router(tele_token_router(signer, current_user))  # POST /api/tele/token
+app.include_router(tele_join_router(current_user))  # /api/tele/invites/{code}[/join], /api/tele/calls/{id}/...
 
 
 @app.post("/calls")
@@ -57,7 +57,7 @@ async def create_call(tele: TeleClientDep, user: TeleUser = Depends(current_user
 In the browser, the prebuilt call UI joins through your backend:
 
 ```js
-call.getJoin = () => fetch(`/tele/invites/${code}/join`, { method: "POST" })
+call.getJoin = () => fetch(`/api/tele/invites/${code}/join`, { method: "POST" })
   .then((r) => r.ok ? r.json() : r.json().then((b) => Promise.reject(b.error)));
 ```
 
@@ -227,41 +227,76 @@ async def usage(tele: TeleClientDep):  # or: tele: AsyncTeleClient = Depends(get
 The client is created at startup and closed at shutdown. To combine it with your own lifespan, enter it inside
 yours: `async with tele_lifespan(factory)(app): yield`.
 
-### Token endpoint
+### Shared backend routes
 
-`tele_token_router(signer, get_user, path="/tele/token", ttl=900)` adds `POST /tele/token`, which returns
-`{"token": "...", "expires_at": "..."}` for the user your `get_user` dependency returns (a `TeleUser`; raise 401
-there for anonymous requests). `get_user` may be a callable or a `Depends(...)`.
+The routers serve the route convention every Tele SDK shares (prefix `/api/tele`, configurable):
 
-### Join proxy
+| Method | Path | Does | Response |
+|---|---|---|---|
+| POST | `/api/tele/token` | user token for the signed-in user | `{"token": "...", "expires_at": "RFC3339"}` |
+| GET | `/api/tele/invites/{code}` | invite preview, as the user (user token) | Tele's body unchanged |
+| POST | `/api/tele/invites/{code}/join` | invite join, as the user (user token) | Tele's join response unchanged |
+| POST | `/api/tele/calls/{id}/join` | call join, service token with `user: {user_id, ip, user_agent, name?, team?}` | Tele's join response unchanged |
+| GET | `/api/tele/calls/{id}/messages` | chat history as the user (`after`, `limit` passed through) | Tele's body unchanged |
+| POST | `/api/tele/calls/{id}/diagnostics` | forwards the call UI's diagnostic body as the user | Tele's status and body |
 
-`tele_join_router(get_user, prefix="/tele")` adds the routes the web call UI and the mobile apps call:
+`tele_token_router(signer, get_user, path="/api/tele/token", ttl=900)` serves the first route; `expires_at` is
+the token's own `exp`. `tele_join_router(get_user, prefix="/api/tele")` serves the rest (`diagnostics=False`
+leaves out the last one). `get_user` is your own authentication: a dependency (or `Depends(...)`) returning a
+`TeleUser`, or raising `HTTPException(401)` for anonymous requests.
 
-| Route | Forwards to |
+`X-Client-Platform` from the app is forwarded (fallback `default_platform="web"`; tele-flutter sends
+`flutter-<os>`), and so is the user agent.
+
+**Errors** always use Tele's shape `{"error": {"code": "...", "message": "..."}}`, including the backend's own:
+
+| Situation | Answer |
 |---|---|
-| `POST /tele/invites/{code}/join` | `POST /v1/invites/{code}/join` |
-| `POST /tele/calls/{call_id}/join` | `POST /v1/calls/{call_id}/join` |
-| `POST /tele/calls/{call_id}/diagnostics` | `POST /v1/calls/{call_id}/diagnostics` (turn off with `diagnostics=False`) |
+| not signed in (`get_user` raises 401) | `401 unauthenticated` |
+| Tele 4xx other than 401 | relayed unchanged |
+| Tele 401 (your backend's credentials) | `502 upstream_auth` |
+| Tele 5xx | `502 upstream_error` |
+| Tele timed out | `503 upstream_timeout` |
+| Tele unreachable | `502 upstream_unreachable` |
+| bad path segment (`.`, `..`) | `404 not_found` / `invite_not_found` |
+| diagnostic body over 64 KB (refused while streaming) | `413 invalid_body` |
 
-Each request runs as the signed-in user and carries their user agent and `X-Client-Platform` (from the app's
-request, default `default_platform="web"`). Tele's answer is returned unchanged, so the UI gets the exact join
-response or Tele error body, except that a Tele `401` (your backend's own credentials) becomes
-`502 upstream_auth`, a Tele `5xx` becomes `502 upstream_error`, and network failures become
-`502 upstream_unreachable` or `503 upstream_timeout`, all in Tele's `{"error": {"code", "message"}}` shape.
-Diagnostic bodies over 64 KB are refused with `413` without being buffered.
+The routers get this from `TeleErrorRoute`, a route class you can reuse for your own routes
+(`APIRouter(route_class=TeleErrorRoute)`), and `tele_error_response(err)` turns a `TeleError` from the client into
+the same response.
 
-**Client IPs.** Hosted Tele does not trust your backend as a proxy, so it ignores `X-Forwarded-For` from it.
+**Client IPs.** Tele records the request's peer IP for user-token calls and trusts no customer proxy on hosted
+Tele. So:
 
-- **Call joins** use your service token with the user and their IP in the body (`service_join=True`, the
-  default), which Tele always records. Set `service_join=False` only if Tele trusts your backend as a proxy; it
-  then forwards the user's token with `X-Forwarded-For`.
-- **Invite joins** must use the user's token: Tele refuses service tokens there. **Tele then records your
-  backend's IP, not the user's**, unless the app joins Tele directly (with a user token from the token endpoint)
-  or your backend is a proxy Tele trusts.
+- **Call-id joins** are service-token joins carrying the end user's IP, so Tele records the correct IP
+  (`service_join=True`, the default; `service_join=False` forwards the user's token instead and is only for a Tele
+  that trusts your backend as a proxy).
+- **Invite joins through a backend record the backend's IP.** Browsers can't avoid this (Tele sends no CORS
+  headers). Native apps can, by calling `POST /v1/invites/{code}/join` directly with a user token from
+  `/api/tele/token`.
+- After the first invite join, rejoin through the call-id route (`POST /api/tele/calls/{id}/join`).
 
-The client IP comes from `request.client.host`; behind a reverse proxy run uvicorn with
+The end user's IP comes from `request.client.host`; behind a reverse proxy run uvicorn with
 `--proxy-headers --forwarded-allow-ips=...`, or pass `client_ip=lambda request: ...`. Pass `client=` to use a
 specific `AsyncTeleClient` instead of the lifespan one.
+
+### Using with tele-nextjs-ui / tele-flutter
+
+The defaults line up, so nothing needs configuring on either side:
+
+```python
+app.include_router(tele_token_router(signer, current_user))  # POST /api/tele/token
+app.include_router(tele_join_router(current_user))  # the other /api/tele routes
+```
+
+- **tele-nextjs-ui** calls `/api/tele/invites/{code}` for the lobby, `/api/tele/invites/{code}/join` and
+  `/api/tele/calls/{id}/join` for `getJoin()`, `/api/tele/calls/{id}/messages` for chat history and
+  `/api/tele/calls/{id}/diagnostics` for diagnostics, on the same origin.
+- **tele-flutter** points at your backend's base URL and calls the same routes with `X-Client-Platform:
+  flutter-<os>`; it can also take a user token from `/api/tele/token` to join an invite directly
+  (`POST /v1/invites/{code}/join`), so Tele records the device's own IP.
+
+If you change `prefix` or `path` here, set the same base path in the UI or app.
 
 ### Webhook dependency
 
@@ -271,7 +306,7 @@ from tele_fastapi.fastapi import TeleWebhook
 from tele_fastapi.webhooks import TeleEvent
 
 
-@app.post("/tele/webhooks", status_code=204, response_model=None)
+@app.post("/api/tele/webhooks", status_code=204, response_model=None)
 async def tele_webhook(event: TeleEvent = Depends(TeleWebhook(os.environ["TELE_WEBHOOK_SECRET"]))): ...
 ```
 
@@ -290,7 +325,8 @@ Answer within 10 seconds and do slow work afterwards; deliveries are at least on
 - Put your own authentication in front of every route here: the routers trust whatever `get_user` returns.
 - Verify webhooks against the raw body before acting on them, and drop duplicate `webhook-id`s.
 - `TeleSigner` and the clients never log or print secrets; `repr(signer)` shows only the key.
-- Invite codes are not credentials, but treat them like links: don't log them.
+- Invite codes: treat them like bearer links. Anyone with the code can preview and (per access policy) join;
+  don't log them.
 
 ## Development
 
