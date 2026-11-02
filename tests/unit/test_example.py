@@ -19,14 +19,15 @@ def test_example_app_builds_with_every_route(monkeypatch: pytest.MonkeyPatch) ->
     paths = module.app.openapi()["paths"]
     routes = {(method.upper(), path) for path, ops in paths.items() for method in ops}
     assert {
-        ("POST", "/tele/token"),
-        ("POST", "/tele/invites/{code}/join"),
-        ("POST", "/tele/calls/{call_id}/join"),
-        ("POST", "/tele/calls/{call_id}/diagnostics"),
-        ("POST", "/calls"),
-        ("GET", "/calls"),
-        ("GET", "/calls/{call_id}/messages"),
-        ("POST", "/calls/{call_id}/end"),
-        ("GET", "/recordings/{recording_id}/download"),
-        ("POST", "/tele/webhooks"),
+        ("POST", "/api/tele/token"),
+        ("POST", "/api/tele/invites/{code}/join"),
+        ("POST", "/api/tele/calls/{call_id}/join"),
+        ("POST", "/api/tele/calls/{call_id}/diagnostics"),
+        ("GET", "/api/tele/invites/{code}"),
+        ("GET", "/api/tele/calls/{call_id}/messages"),
+        ("POST", "/api/calls"),
+        ("GET", "/api/calls"),
+        ("POST", "/api/calls/{call_id}/end"),
+        ("GET", "/api/recordings/{recording_id}/download"),
+        ("POST", "/api/tele/webhooks"),
     } <= routes

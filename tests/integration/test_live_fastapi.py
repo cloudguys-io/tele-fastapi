@@ -31,13 +31,16 @@ def test_example_app_join_proxy_live(signer: TeleSigner, base_url: str, uid: str
     app = example.create_app(signer, base_url=base_url)
     host, member = f"{uid}-host", f"{uid}-member"
     with TestClient(app, client=("203.0.113.44", 50000)) as client:
-        r = client.post("/calls", json={"title": f"{uid} proxy", "members": [member]}, headers={"X-Demo-User": host})
+        r = client.post(
+            "/api/calls", json={"title": f"{uid} proxy", "members": [member]}, headers={"X-Demo-User": host}
+        )
         assert r.status_code == 201, r.text
         call = r.json()
 
         # the call UI's getJoin(): invite join and direct join, both returning Tele's join response unchanged
         joined = client.post(
-            f"/tele/invites/{call['invite_code']}/join", headers={"X-Demo-User": member, "X-Client-Platform": "android"}
+            f"/api/tele/invites/{call['invite_code']}/join",
+            headers={"X-Demo-User": member, "X-Client-Platform": "android"},
         )
         assert joined.status_code == 200, joined.text
         body = joined.json()
@@ -52,20 +55,20 @@ def test_example_app_join_proxy_live(signer: TeleSigner, base_url: str, uid: str
             "call",
         }
         assert body["role"] == "participant" and body["call"]["id"] == call["id"]
-        hosted = client.post(f"/tele/calls/{call['id']}/join", headers={"X-Demo-User": host})
+        hosted = client.post(f"/api/tele/calls/{call['id']}/join", headers={"X-Demo-User": host})
         assert hosted.status_code == 200 and hosted.json()["role"] == "host"
 
         # Tele errors come back unchanged too
-        stranger = client.post(f"/tele/invites/{call['invite_code']}/join", headers={"X-Demo-User": f"{uid}-x"})
+        stranger = client.post(f"/api/tele/invites/{call['invite_code']}/join", headers={"X-Demo-User": f"{uid}-x"})
         assert stranger.status_code == 403 and stranger.json()["error"]["code"] == "not_invited"
-        assert client.post("/tele/invites/nope/join", headers={"X-Demo-User": member}).json()["error"]["code"] == (
+        assert client.post("/api/tele/invites/nope/join", headers={"X-Demo-User": member}).json()["error"]["code"] == (
             "invite_not_found"
         )
-        assert client.post(f"/tele/calls/{call['id']}/join").status_code == 401
+        assert client.post(f"/api/tele/calls/{call['id']}/join").status_code == 401
 
         # diagnostics are relayed: Tele answers session_pending until media reports the participant
         diag = client.post(
-            f"/tele/calls/{call['id']}/diagnostics",
+            f"/api/tele/calls/{call['id']}/diagnostics",
             headers={"X-Demo-User": member},
             json={
                 "grant_id": body["grant_id"],
@@ -77,18 +80,27 @@ def test_example_app_join_proxy_live(signer: TeleSigner, base_url: str, uid: str
         assert diag.status_code == 409 and diag.json()["error"]["code"] == "session_pending"
 
         # the token endpoint mints a user token Tele accepts
-        token = client.post("/tele/token", headers={"X-Demo-User": member}).json()["token"]
+        token = client.post("/api/tele/token", headers={"X-Demo-User": member}).json()["token"]
         assert jwt.decode(token, options={"verify_signature": False})["sub"] == member
         with TeleClient(token=token, base_url=base_url) as as_member:
             me = as_member.me()
             assert me.user is not None and me.user.user_id == member
 
-        assert call["id"] in {c["id"] for c in client.get("/calls", headers={"X-Demo-User": member}).json()}
-        assert client.get(f"/calls/{call['id']}/messages", headers={"X-Demo-User": member}).json() == []
-        missing = client.get("/recordings/00000000-0000-0000-0000-000000000000/download", headers={"X-Demo-User": host})
-        assert missing.status_code == 404
-        assert client.post(f"/calls/{call['id']}/end", headers={"X-Demo-User": member}).status_code == 403
-        assert client.post(f"/calls/{call['id']}/end", headers={"X-Demo-User": host}).json()["status"] == "ended"
+        assert call["id"] in {c["id"] for c in client.get("/api/calls", headers={"X-Demo-User": member}).json()}
+        history = client.get(f"/api/tele/calls/{call['id']}/messages?limit=5&junk=1", headers={"X-Demo-User": member})
+        assert history.status_code == 200 and history.json() == {"messages": []}
+        preview = client.get(f"/api/tele/invites/{call['invite_code']}", headers={"X-Demo-User": member})
+        assert preview.status_code == 200 and preview.json()["call"]["id"] == call["id"]
+        assert preview.json()["can_join_now"] is True
+        anon = client.get(f"/api/tele/invites/{call['invite_code']}")
+        assert anon.status_code == 401 and anon.json()["error"]["code"] == "unauthenticated"
+        missing = client.get(
+            "/api/recordings/00000000-0000-0000-0000-000000000000/download", headers={"X-Demo-User": host}
+        )
+        assert missing.status_code == 404 and missing.json()["error"]["code"] == "not_found"
+        not_host = client.post(f"/api/calls/{call['id']}/end", headers={"X-Demo-User": member})
+        assert not_host.status_code == 403 and not_host.json()["error"]["code"] == "forbidden"
+        assert client.post(f"/api/calls/{call['id']}/end", headers={"X-Demo-User": host}).json()["status"] == "ended"
 
 
 def test_service_join_mode_live(signer: TeleSigner, base_url: str, uid: str) -> None:
@@ -105,7 +117,7 @@ def test_service_join_mode_live(signer: TeleSigner, base_url: str, uid: str) -> 
         )
         with TestClient(app) as client:
             r = client.post(
-                f"/tele/calls/{call.id}/join", headers={"User-Agent": "Huddle/2", "X-Client-Platform": "ios"}
+                f"/api/tele/calls/{call.id}/join", headers={"User-Agent": "Huddle/2", "X-Client-Platform": "ios"}
             )
         assert r.status_code == 200, r.text
         assert r.json()["role"] == "participant"
