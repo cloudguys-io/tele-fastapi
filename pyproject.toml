@@ -1,0 +1,66 @@
+[project]
+name = "tele-fastapi"
+version = "0.1.0"
+description = "Python server SDK for the Tele video-calling API, with first-class FastAPI integration"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Cloudguys" }]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27,<1",
+    "pydantic>=2.6,<3",
+    "PyJWT>=2.8,<3",
+]
+classifiers = [
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.110"]
+
+[project.urls]
+Homepage = "https://github.com/cloudguys-io/tele-fastapi"
+
+[dependency-groups]
+dev = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pytest>=8",
+    "anyio>=4",
+    "mypy>=1.10",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tele_fastapi"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["src/tele_fastapi"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs a live Tele API (TELE_API_URL, TELE_API_KEY, TELE_API_SECRET)"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header", "fastapi.params.Depends", "tele_fastapi.fastapi.TeleWebhook"]
