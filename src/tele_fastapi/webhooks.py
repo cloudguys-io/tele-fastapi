@@ -40,6 +40,7 @@ __all__ = [
     "TeleEvent",
     "UnknownEvent",
     "WebhookPayloadError",
+    "WebhookSecretError",
     "WebhookTestEvent",
     "WebhookVerificationError",
     "construct_event",
@@ -54,6 +55,10 @@ _SECRET_PREFIX = "whsec_"
 
 class WebhookVerificationError(Exception):
     """The request is not a genuine Tele webhook (missing headers, stale timestamp, or a bad signature)."""
+
+
+class WebhookSecretError(ValueError):
+    """No usable secret: every configured secret is empty or not ``whsec_`` + base64. A configuration error."""
 
 
 class WebhookPayloadError(ValueError):
@@ -73,17 +78,27 @@ def _header(headers: Headers, name: str) -> str:
     return value
 
 
-def _key(secret: str) -> bytes:
+def _key(secret: str) -> bytes | None:
+    if not secret:
+        return None
     try:
-        return base64.b64decode(secret.removeprefix(_SECRET_PREFIX), validate=True)
+        key = base64.b64decode(secret.removeprefix(_SECRET_PREFIX), validate=True)
     except (binascii.Error, ValueError):
-        raise WebhookVerificationError("webhook secret is not valid base64") from None
+        return None
+    return key or None
+
+
+def _sign(key: bytes, msg_id: str, timestamp: int, body: bytes) -> str:
+    mac = hmac.new(key, f"{msg_id}.{timestamp}.".encode() + body, hashlib.sha256)
+    return "v1," + base64.b64encode(mac.digest()).decode()
 
 
 def sign_webhook(secret: str, msg_id: str, timestamp: int, body: bytes) -> str:
     """Return the ``v1,<base64>`` signature Tele would send for this message. Useful in tests."""
-    mac = hmac.new(_key(secret), f"{msg_id}.{timestamp}.".encode() + body, hashlib.sha256)
-    return "v1," + base64.b64encode(mac.digest()).decode()
+    key = _key(secret)
+    if key is None:
+        raise WebhookSecretError("webhook secret is not whsec_ + base64")
+    return _sign(key, msg_id, timestamp, body)
 
 
 def verify_webhook(
@@ -99,8 +114,13 @@ def verify_webhook(
     ``secret`` is the endpoint secret (``whsec_...``), or several secrets if you are switching between them
     yourself. ``headers`` is any mapping (Starlette, httpx or a dict). ``body`` is the raw body exactly as
     received. Raises :class:`WebhookVerificationError` if the message is not from Tele or is more than
-    ``tolerance`` seconds (default 5 minutes) away from ``now``.
+    ``tolerance`` seconds (default 5 minutes) away from ``now``. Malformed secrets in a list are skipped; if none
+    is usable it raises :class:`WebhookSecretError` (a configuration problem, not a bad request).
     """
+    secrets = [secret] if isinstance(secret, str) else list(secret)
+    keys = [k for k in (_key(s) for s in secrets) if k is not None]
+    if not keys:
+        raise WebhookSecretError("no usable webhook secret configured (expected whsec_ + base64)")
     msg_id = _header(headers, "webhook-id")
     ts = _header(headers, "webhook-timestamp")
     sigs = _header(headers, "webhook-signature")
@@ -115,12 +135,9 @@ def verify_webhook(
         raise WebhookVerificationError("webhook timestamp is too old or in the future")
 
     raw = body.encode() if isinstance(body, str) else body
-    secrets = [secret] if isinstance(secret, str) else list(secret)
-    if not secrets:
-        raise WebhookVerificationError("no webhook secret configured")
     received = [s.encode() for s in sigs.split()]
-    for sec in secrets:
-        want = sign_webhook(sec, msg_id, sent, raw).encode()
+    for key in keys:
+        want = _sign(key, msg_id, sent, raw).encode()
         if any(hmac.compare_digest(got, want) for got in received):
             return msg_id
     raise WebhookVerificationError("webhook signature does not match")

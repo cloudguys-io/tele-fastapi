@@ -23,6 +23,7 @@ from tele_fastapi.webhooks import (
     RecordingStartedEvent,
     UnknownEvent,
     WebhookPayloadError,
+    WebhookSecretError,
     WebhookTestEvent,
     WebhookVerificationError,
     construct_event,
@@ -93,10 +94,16 @@ def test_tolerance_edges_and_tampering() -> None:
     assert verify_webhook(SECRET, headers(), BODY, now=TS + 300)
     with pytest.raises(WebhookVerificationError):
         verify_webhook(SECRET, headers(), BODY + b" ", now=TS)
-    with pytest.raises(WebhookVerificationError, match="base64"):
-        verify_webhook("whsec_***", headers(), BODY, now=TS)
-    with pytest.raises(WebhookVerificationError, match="no webhook secret"):
-        verify_webhook([], headers(), BODY, now=TS)
+
+
+def test_malformed_secrets_are_skipped_and_none_usable_is_a_config_error() -> None:
+    assert verify_webhook(["whsec_***", "", SECRET], headers(), BODY, now=TS) == MSG_ID
+    for bad in ("whsec_***", [], ["", "not base64!"]):
+        with pytest.raises(WebhookSecretError, match="no usable webhook secret"):
+            verify_webhook(bad, headers(), BODY, now=TS)
+    assert not issubclass(WebhookSecretError, WebhookVerificationError)
+    with pytest.raises(WebhookSecretError):
+        sign_webhook("whsec_***", MSG_ID, TS, BODY)
 
 
 CALL = {"id": "c1", "title": "Weekly", "host_user_id": "user-123"}
