@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -62,7 +63,8 @@ def test_token_router(dep: Any) -> None:
             {"scope": "user"},
         )
         assert claims["exp"] - claims["iat"] == 600
-        assert body["expires_at"].startswith(time.strftime("%Y", time.gmtime()))
+        expires = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
+        assert expires == datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
         assert client.post("/tele/token").status_code == 401
 
 
@@ -118,14 +120,80 @@ def test_invite_join_forwards_user_token_ip_platform_and_returns_body_unchanged(
     assert up.headers["user-agent"] == "Huddle/2 (Android 15)"
 
 
-def test_call_join_defaults_platform_and_uses_request_client_host() -> None:
+def test_call_join_defaults_to_a_service_join() -> None:
     fake = FakeTele()
-    with TestClient(proxy_app(fake, default_platform="web")) as client:
+    with TestClient(proxy_app(fake, client_ip=lambda r: "2001:db8::7")) as client:
         assert client.post("/tele/calls/call-1/join", headers=SIGNED_IN).status_code == 200
     up = fake.seen[0]
-    assert up.url.path == "/v1/calls/call-1/join" and up.content == b""
-    assert up.headers["x-client-platform"] == "web"
-    assert up.headers["x-forwarded-for"] == "testclient"  # Starlette's TestClient peer
+    assert up.url.path == "/v1/calls/call-1/join" and up.headers["x-client-platform"] == "web"
+    assert claims_of(up)["tele"] == {"scope": "service"}
+    assert json.loads(up.content)["user"]["ip"] == "2001:db8::7"
+
+
+def test_service_join_refuses_a_peer_that_is_not_an_ip() -> None:
+    fake = FakeTele()
+    with TestClient(proxy_app(fake)) as client:  # TestClient's peer is "testclient" (or absent on old Starlette)
+        r = client.post("/tele/calls/call-1/join", headers=SIGNED_IN)
+    assert r.status_code == 400 and r.json()["error"]["code"] == "invalid_request"
+    assert fake.seen == []
+
+
+def test_call_join_as_user_when_service_join_is_off() -> None:
+    fake = FakeTele()
+    with TestClient(proxy_app(fake, service_join=False, client_ip=lambda r: "203.0.113.10")) as client:
+        assert client.post("/tele/calls/call-1/join", headers=SIGNED_IN).status_code == 200
+    up = fake.seen[0]
+    assert up.content == b"" and claims_of(up)["sub"] == "alice"
+    assert up.headers["x-forwarded-for"] == "203.0.113.10" and up.headers["x-client-platform"] == "web"
+
+
+@pytest.mark.parametrize(
+    ("upstream", "status", "code"),
+    [
+        ((401, {"error": {"code": "unauthenticated", "message": "bad key"}}), 502, "upstream_auth"),
+        ((500, {"error": {"code": "internal", "message": "x"}}), 502, "upstream_error"),
+        ((503, None), 502, "upstream_error"),
+    ],
+)
+def test_upstream_auth_and_server_errors_are_mapped(upstream: tuple[int, Any], status: int, code: str) -> None:
+    fake = FakeTele()
+    fake.answer = upstream
+    with TestClient(proxy_app(fake)) as client:
+        r = client.post("/tele/invites/abc/join", headers=SIGNED_IN)
+    assert r.status_code == status and r.json()["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    ("exc", "status", "code"),
+    [
+        (httpx.ConnectError("refused"), 502, "upstream_unreachable"),
+        (httpx.ReadTimeout("slow"), 503, "upstream_timeout"),
+    ],
+)
+def test_network_errors_become_json_errors(exc: Exception, status: int, code: str) -> None:
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    tele = AsyncTeleClient(
+        SIGNER, base_url="https://tele.test", http_client=httpx.AsyncClient(transport=httpx.MockTransport(boom))
+    )
+    app = FastAPI()
+    app.include_router(tele_join_router(current_user, client=tele, client_ip=lambda r: "203.0.113.1"))
+    with TestClient(app) as client:
+        for path in ("/tele/invites/abc/join", "/tele/calls/c/join", "/tele/calls/c/diagnostics"):
+            r = client.post(path, headers=SIGNED_IN, content=b"{}")
+            assert r.status_code == status and r.json()["error"]["code"] == code
+
+
+@pytest.mark.parametrize(
+    "path", ["/tele/invites/%2E%2E/join", "/tele/calls/%2E/join", "/tele/calls/%2E%2E/diagnostics"]
+)
+def test_dot_segments_are_refused(path: str) -> None:
+    fake = FakeTele()
+    with TestClient(proxy_app(fake, client_ip=lambda r: "203.0.113.1")) as client:
+        r = client.post(path, headers=SIGNED_IN)
+    assert r.status_code == 404 and r.json()["error"]["code"] in ("invite_not_found", "not_found")
+    assert fake.seen == []
 
 
 def test_tele_errors_are_relayed_unchanged() -> None:
@@ -166,7 +234,15 @@ def test_diagnostics_are_forwarded_as_is() -> None:
     with TestClient(proxy_app(fake)) as client:
         r = client.post("/tele/calls/call-1/diagnostics", headers=SIGNED_IN, content=json.dumps(report))
         assert r.status_code == 204
-        assert client.post("/tele/calls/call-1/diagnostics", headers=SIGNED_IN, content=b"x" * 70000).status_code == 413
+        big = client.post("/tele/calls/call-1/diagnostics", headers=SIGNED_IN, content=b"x" * 70000)
+        assert big.status_code == 413 and big.json()["error"]["code"] == "invalid_body"
+
+        def chunks() -> Any:  # no Content-Length: the cap applies while streaming
+            for _ in range(20):
+                yield b"x" * 4096
+
+        streamed = client.post("/tele/calls/call-1/diagnostics", headers=SIGNED_IN, content=chunks())
+        assert streamed.status_code == 413
     up = fake.seen[0]
     assert up.url.path == "/v1/calls/call-1/diagnostics" and json.loads(up.content) == report
     assert claims_of(up)["sub"] == "alice"
@@ -175,7 +251,11 @@ def test_diagnostics_are_forwarded_as_is() -> None:
 def test_diagnostics_route_can_be_disabled_and_client_passed_explicitly() -> None:
     fake = FakeTele()
     app = FastAPI()
-    app.include_router(tele_join_router(current_user, client=fake.client(), prefix="/api", diagnostics=False))
+    app.include_router(
+        tele_join_router(
+            current_user, client=fake.client(), prefix="/api", diagnostics=False, client_ip=lambda r: "203.0.113.2"
+        )
+    )
     with TestClient(app) as client:
         assert client.post("/api/calls/c/join", headers=SIGNED_IN).status_code == 200
         assert client.post("/api/calls/c/diagnostics", headers=SIGNED_IN).status_code == 404
@@ -222,7 +302,7 @@ def webhook_app(secret: Any) -> tuple[FastAPI, list[TeleEvent]]:
     app = FastAPI()
     got: list[TeleEvent] = []
 
-    @app.post("/tele/webhooks", status_code=204)
+    @app.post("/tele/webhooks", status_code=204, response_model=None)
     async def hook(event: TeleEvent = Depends(TeleWebhook(secret))) -> None:
         got.append(event)
 
@@ -296,4 +376,14 @@ def test_webhook_rotation_and_callable_secrets() -> None:
         assert client.post("/tele/webhooks", content=body, headers=signed(body)).status_code == 204
     assert isinstance(got[0], WebhookTestEvent)
     assert TeleWebhook(lambda: None).secrets() == []
+
+
+def test_webhook_with_only_malformed_secrets_is_a_500() -> None:
+    app, _ = webhook_app(["whsec_***", "nope!"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        r = client.post("/tele/webhooks", content=ENDED, headers=signed(ENDED))
+    assert r.status_code == 500 and "misconfigured" in r.json()["detail"]
+    app, _got = webhook_app(["whsec_***", HOOK_SECRET])
+    with TestClient(app) as client:
+        assert client.post("/tele/webhooks", content=ENDED, headers=signed(ENDED)).status_code == 204
     assert TeleWebhook([HOOK_SECRET, ""]).secrets() == [HOOK_SECRET]

@@ -109,7 +109,7 @@ def create_app(signer: TeleSigner, *, base_url: str = DEFAULT_BASE_URL, webhook_
 
     if webhook_secret:
 
-        @app.post("/tele/webhooks", status_code=204)
+        @app.post("/tele/webhooks", status_code=204, response_model=None)
         async def tele_webhook(event: TeleEvent = Depends(TeleWebhook(webhook_secret))) -> None:
             if isinstance(event, CallEndedEvent) and event.data.usage:
                 log.info("call %s cost %s %s", event.data.call.id, event.data.usage.amount, event.data.usage.currency)

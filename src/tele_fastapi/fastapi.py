@@ -3,16 +3,22 @@
 Needs the ``fastapi`` extra: ``pip install "tele-fastapi[fastapi]"``.
 """
 
-from __future__ import annotations
+# No ``from __future__ import annotations`` here: FastAPI before 0.124 can't resolve string annotations on a
+# dependency class's ``__call__``, so these annotations must be real objects at runtime.
 
-from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+import ipaddress
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
+
+import httpx
+import jwt
 
 try:
     from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
     from fastapi.params import Depends as DependsParam
+    from fastapi.responses import JSONResponse
 except ImportError as e:  # pragma: no cover - exercised only without the extra
     raise ImportError('tele_fastapi.fastapi needs FastAPI: pip install "tele-fastapi[fastapi]"') from e
 
@@ -26,6 +32,7 @@ from .webhooks import (
     WEBHOOK_TOLERANCE_SECONDS,
     TeleEvent,
     WebhookPayloadError,
+    WebhookSecretError,
     WebhookVerificationError,
     parse_event,
     verify_webhook,
@@ -117,7 +124,8 @@ def tele_token_router(
     @router.post(path, response_model=TokenResponse, summary="Get a Tele user token")
     def tele_token(user: TeleUser = user_dep) -> TokenResponse:
         token = signer.user_token(user, seconds)
-        expires = datetime.fromtimestamp(signer.now() + int(seconds), tz=timezone.utc)
+        exp = jwt.decode(token, options={"verify_signature": False})["exp"]
+        expires = datetime.fromtimestamp(exp, tz=timezone.utc)
         return TokenResponse(token=token, expires_at=expires)
 
     return router
@@ -125,12 +133,35 @@ def tele_token_router(
 
 # ---- join proxy ----
 
+MAX_DIAGNOSTIC_BYTES = 64 * 1024
+
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def _relay(upstream: Any) -> Response:
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _error(status: int, code: str, message: str) -> JSONResponse:
+    """An error in Tele's own shape, so the call UI handles it like any Tele error."""
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status)
+
+
+def _relay(upstream: httpx.Response) -> Response:
+    if upstream.status_code == 401:
+        # Our backend's key or secret was refused: not something the app's user can fix.
+        return _error(502, "upstream_auth", "the backend's Tele credentials were rejected")
+    if upstream.status_code >= 500:
+        code = ""
+        with suppress(ValueError, KeyError, TypeError):
+            code = str(upstream.json()["error"]["code"])
+        return _error(502, "upstream_error", f"Tele answered {upstream.status_code} {code}".strip())
     if upstream.status_code == 204 or not upstream.content:
         return Response(status_code=upstream.status_code)
     return Response(
@@ -138,6 +169,15 @@ def _relay(upstream: Any) -> Response:
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
     )
+
+
+async def _forward(send: Callable[[], Awaitable[httpx.Response]]) -> Response:
+    try:
+        return _relay(await send())
+    except httpx.TimeoutException:
+        return _error(503, "upstream_timeout", "Tele did not answer in time")
+    except httpx.HTTPError as e:
+        return _error(502, "upstream_unreachable", f"could not reach Tele ({type(e).__name__})")
 
 
 def tele_join_router(
@@ -148,7 +188,7 @@ def tele_join_router(
     user_token_ttl: float | timedelta = 900,
     default_platform: str = "web",
     client_ip: Callable[[Request], str | None] = _client_ip,
-    service_join: bool = False,
+    service_join: bool = True,
     diagnostics: bool = True,
     tags: Sequence[str] = ("tele",),
 ) -> APIRouter:
@@ -158,15 +198,22 @@ def tele_join_router(
     - ``POST {prefix}/calls/{call_id}/join``
     - ``POST {prefix}/calls/{call_id}/diagnostics`` (``diagnostics=True``; the ``<tele-call>`` diagnostics body)
 
-    Each request is forwarded as the signed-in user with their real IP (``X-Forwarded-For``), user agent and
-    ``X-Client-Platform`` (default ``default_platform``). Tele's response, success or error, is returned unchanged,
-    so ``getJoin()`` in the call UI gets exactly the join response or Tele error body.
+    Each request runs as the signed-in user with their user agent and ``X-Client-Platform`` (default
+    ``default_platform``). Tele's answer is returned unchanged, so ``getJoin()`` in the call UI gets exactly the
+    join response or Tele's error body, with three exceptions in the same ``{"error": {"code", "message"}}`` shape:
+    a Tele ``401`` (your backend's credentials) becomes ``502 upstream_auth``, a Tele ``5xx`` becomes
+    ``502 upstream_error``, and network failures become ``502 upstream_unreachable`` / ``503 upstream_timeout``.
 
-    Tele only trusts ``X-Forwarded-For`` from proxies it is configured to trust. If your backend is not one,
-    set ``service_join=True``: call joins then use a service token with the user's IP in the body, which Tele
-    always records. Invite joins always use the user's token. ``client`` defaults to the app's shared client
-    (:func:`tele_lifespan`); ``client_ip`` defaults to ``request.client.host`` (run uvicorn with
-    ``--proxy-headers`` behind a reverse proxy).
+    **Client IPs.** Hosted Tele does not trust your backend as a proxy, so it ignores ``X-Forwarded-For`` from it.
+
+    - Call joins (``service_join=True``, the default) use your service token with the user and their IP in the
+      body, which Tele always records. Set ``service_join=False`` only if Tele trusts your backend as a proxy.
+    - Invite joins must use the user's token (Tele refuses service tokens there). Tele then records **your
+      backend's IP**, not the user's, unless the app joins Tele directly with a user token from
+      :func:`tele_token_router`, or your backend is a proxy Tele trusts. ``X-Forwarded-For`` is still sent.
+
+    ``client`` defaults to the app's shared client (:func:`tele_lifespan`); ``client_ip`` defaults to
+    ``request.client.host`` (run uvicorn with ``--proxy-headers`` behind a reverse proxy).
     """
     ttl = b.ttl_seconds(user_token_ttl)
     router = APIRouter(prefix=prefix, tags=list(tags))
@@ -181,50 +228,64 @@ def tele_join_router(
 
     @router.post("/invites/{code}/join", summary="Join a Tele call through an invite")
     async def join_invite(code: str, request: Request, user: TeleUser = user_dep) -> Response:
+        try:
+            path = f"/v1/invites/{b.seg(code)}/join"
+        except ValueError:
+            return _error(404, "invite_not_found", "invite not found")
         platform, ip, ua = headers(request)
         tele = tele_for(request).as_user(user, ttl=ttl)
-        upstream = await tele.raw_request(
-            "POST", f"/v1/invites/{b.seg(code)}/join", headers=b.join_headers(platform, ip, ua)
-        )
-        return _relay(upstream)
+        return await _forward(lambda: tele.raw_request("POST", path, headers=b.join_headers(platform, ip, ua)))
 
     @router.post("/calls/{call_id}/join", summary="Join a Tele call you are a member of")
     async def join_call(call_id: str, request: Request, user: TeleUser = user_dep) -> Response:
+        try:
+            path = f"/v1/calls/{b.seg(call_id)}/join"
+        except ValueError:
+            return _error(404, "not_found", "call not found")
         platform, ip, ua = headers(request)
-        path = f"/v1/calls/{b.seg(call_id)}/join"
-        if service_join:
-            if not ip:
-                raise HTTPException(400, "client IP unknown")
-            joiner = JoinUser(
-                user_id=user.id,
-                ip=ip,
-                name=user.name or None,
-                team=user.team or None,
-                user_agent=ua[:512] if ua else None,
-            )
-            upstream = await tele_for(request).raw_request(
+        if not service_join:
+            as_user = tele_for(request).as_user(user, ttl=ttl)
+            return await _forward(lambda: as_user.raw_request("POST", path, headers=b.join_headers(platform, ip, ua)))
+        if not ip or not _is_ip(ip):
+            return _error(400, "invalid_request", "the client's IP address is unknown")
+        joiner = JoinUser(
+            user_id=user.id,
+            ip=ip,
+            name=user.name or None,
+            team=user.team or None,
+            user_agent=ua[:512] if ua else None,
+        )
+        tele = tele_for(request)
+        return await _forward(
+            lambda: tele.raw_request(
                 "POST", path, json={"user": b.join_user_input(joiner)}, headers=b.join_headers(platform, None, None)
             )
-        else:
-            tele = tele_for(request).as_user(user, ttl=ttl)
-            upstream = await tele.raw_request("POST", path, headers=b.join_headers(platform, ip, ua))
-        return _relay(upstream)
+        )
 
     if diagnostics:
 
         @router.post("/calls/{call_id}/diagnostics", summary="Forward a call diagnostic report")
         async def report_diagnostic(call_id: str, request: Request, user: TeleUser = user_dep) -> Response:
-            body = await request.body()
-            if len(body) > 64 * 1024:
-                raise HTTPException(413, "diagnostic report too large")
+            try:
+                path = f"/v1/calls/{b.seg(call_id)}/diagnostics"
+            except ValueError:
+                return _error(404, "not_found", "call not found")
+            too_large = _error(413, "invalid_body", f"diagnostic report over {MAX_DIAGNOSTIC_BYTES} bytes")
+            declared = request.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > MAX_DIAGNOSTIC_BYTES:
+                return too_large
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_DIAGNOSTIC_BYTES:
+                    return too_large
+                chunks.append(chunk)
+            body = b"".join(chunks)
             tele = tele_for(request).as_user(user, ttl=ttl)
-            upstream = await tele.raw_request(
-                "POST",
-                f"/v1/calls/{b.seg(call_id)}/diagnostics",
-                content=body,
-                headers={"Content-Type": "application/json"},
+            return await _forward(
+                lambda: tele.raw_request("POST", path, content=body, headers={"Content-Type": "application/json"})
             )
-            return _relay(upstream)
 
     return router
 
@@ -237,13 +298,13 @@ SecretSource = str | Sequence[str] | Callable[[], str | Sequence[str] | None]
 class TeleWebhook:
     """Dependency that verifies a Tele webhook against the raw body and returns the typed event.
 
-    >>> @app.post("/tele/webhooks", status_code=204)
+    >>> @app.post("/tele/webhooks", status_code=204, response_model=None)
     ... async def hook(event: TeleEvent = Depends(TeleWebhook(os.environ["TELE_WEBHOOK_SECRET"]))):
     ...     if isinstance(event, CallEndedEvent): ...
 
     ``secret`` is a secret, several secrets, or a callable returning them (for secrets you load or rotate at
-    runtime). A bad or stale signature answers ``401``, a body that is not a Tele event ``400``, and a missing
-    secret ``503``.
+    runtime). A bad or stale signature answers ``401``, a body that is not a Tele event ``400``, no secret at all
+    ``503``, and secrets that are all malformed (not ``whsec_`` + base64) ``500``: that is a configuration error.
     """
 
     def __init__(self, secret: SecretSource, *, tolerance: int = WEBHOOK_TOLERANCE_SECONDS) -> None:
@@ -263,6 +324,8 @@ class TeleWebhook:
         body = await request.body()
         try:
             verify_webhook(secrets, request.headers, body, tolerance=self._tolerance)
+        except WebhookSecretError as e:
+            raise HTTPException(500, f"Tele webhook misconfigured: {e}") from None
         except WebhookVerificationError as e:
             raise HTTPException(401, str(e)) from None
         try:

@@ -30,7 +30,7 @@ def test_example_app_join_proxy_live(signer: TeleSigner, base_url: str, uid: str
     example = load_example()
     app = example.create_app(signer, base_url=base_url)
     host, member = f"{uid}-host", f"{uid}-member"
-    with TestClient(app) as client:
+    with TestClient(app, client=("203.0.113.44", 50000)) as client:
         r = client.post("/calls", json={"title": f"{uid} proxy", "members": [member]}, headers={"X-Demo-User": host})
         assert r.status_code == 201, r.text
         call = r.json()
